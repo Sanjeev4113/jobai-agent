@@ -1,0 +1,10 @@
+/node_modules
+.env*
+jobai/out/
+jobai/state/
+jobai/applicant.json
+jobai/resume/base.tex
+jobai/resume/base.pdf
+jobai/resume/*.build.*
+jobai/resume/glyphtounicode.tex
+.DS_Store

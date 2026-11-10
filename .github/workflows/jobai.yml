@@ -1,0 +1,94 @@
+# JobAI (lives in the jobai-agent repo; exported by scripts/export-jobai.mjs): every hour, find matching jobs, tailor the resume with Claude Opus 5.5, and email a digest.
+# Secrets (Settings → Secrets and variables → Actions):
+#   GEMINI_API_KEY or GROQ_API_KEY (free) or ANTHROPIC_API_KEY, GMAIL_USER, GMAIL_APP_PASSWORD     required
+#   RESUME_TEX_B64     base64 of your Overleaf main.tex (or commit jobai/resume/base.tex)
+#   APPLICANT_JSON     your application details (see jobai/applicant.example.json)
+#   ADZUNA_APP_ID, ADZUNA_APP_KEY, JOOBLE_API_KEY          optional, widen the search worldwide
+name: JobAI
+
+# Free-minutes plan (fail-proof):
+#   public repo  → unlimited Actions minutes → runs every hour (both schedules fire)
+#   private repo → 2,000 free minutes/month  → only the 3-hourly schedule runs (~240 runs × ≤6 min ≈ 1,440 min)
+# A skipped job costs nothing, so no setting has to change when the repo goes public or private.
+on:
+  schedule:
+    - cron: "7 */3 * * *" # 00:07, 03:07, 06:07 … UTC: always runs
+    - cron: "7 1,2,4,5,7,8,10,11,13,14,16,17,19,20,22,23 * * *" # the other hours: only when the repo is public
+  workflow_dispatch:
+
+concurrency:
+  group: jobai
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    if: github.event_name != 'schedule' || github.event.schedule == '7 */3 * * *' || !github.event.repository.private
+    runs-on: ubuntu-latest
+    timeout-minutes: 12 # hard cap so one stuck run can't eat the free minutes
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install Tectonic (LaTeX → PDF)
+        run: |
+          curl -fsSL "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.15.0/tectonic-0.15.0-x86_64-unknown-linux-musl.tar.gz" | sudo tar xz -C /usr/local/bin
+          tectonic --version
+
+      - name: Cache LaTeX packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Tectonic
+          key: tectonic-v1
+
+      - name: Restore JobAI state (jobs already seen)
+        uses: actions/cache/restore@v4
+        with:
+          path: jobai/state
+          key: jobai-state-${{ github.run_id }}
+          restore-keys: jobai-state-
+
+      - name: Base resume from secret
+        env:
+          RESUME_TEX_B64: ${{ secrets.RESUME_TEX_B64 }}
+        run: |
+          if [ -n "$RESUME_TEX_B64" ]; then mkdir -p jobai/resume && echo "$RESUME_TEX_B64" | base64 -d > jobai/resume/base.tex; fi
+
+      - name: Run JobAI
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          APPLICANT_JSON: ${{ secrets.APPLICANT_JSON }}
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          JOOBLE_API_KEY: ${{ secrets.JOOBLE_API_KEY }}
+          JOBAI_SEND_EMPTY: ${{ vars.JOBAI_SEND_EMPTY || '1' }}
+          JOBAI_MAX_TAILOR_PER_DAY: ${{ vars.JOBAI_MAX_TAILOR_PER_DAY || '15' }}
+        run: npx tsx jobai/run.ts
+
+      - name: Save JobAI state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: jobai/state
+          key: jobai-state-${{ github.run_id }}
+
+      - name: Keep tailored resumes (7 days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jobai-resumes-${{ github.run_id }}
+          path: jobai/out/resumes
+          if-no-files-found: ignore
+          retention-days: 7

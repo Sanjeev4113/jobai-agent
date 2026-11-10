@@ -1,0 +1,23 @@
+{
+  "name": "jobai-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sanjeev's hourly job-search agent: finds matching roles at 40+ companies, tailors the resume with Claude or free models, emails a digest.",
+  "scripts": {
+    "jobai": "tsx --env-file-if-exists=.env.local jobai/run.ts",
+    "resume": "tsx --env-file-if-exists=.env.local jobai/tailor-cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.7.0",
+    "nodemailer": "^10.3.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/nodemailer": "^8.0.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5"
+  }
+}
