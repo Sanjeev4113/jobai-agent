@@ -29,7 +29,7 @@ export async function ollamaUp() {
   }
   return ollamaSeen.up;
 }
-const ollama: Provider = { id: "ollama", label: "Ollama · on your Mac", url: `${OLLAMA}/v1/chat/completions`, model: process.env.OLLAMA_MODEL ?? "qwen3:8b", maxContext: Number(process.env.OLLAMA_CONTEXT ?? 16_000), private: true };
+const ollama: Provider = { id: "ollama", label: "Ollama · on your Mac", url: `${OLLAMA}/v1/chat/completions`, model: process.env.OLLAMA_MODEL ?? "jarvis", maxContext: Number(process.env.OLLAMA_CONTEXT ?? 16_000), private: true };
 
 export function providers(task: "chat" | "long" = "chat", sensitive = false): Provider[] {
   const list: Provider[] = [];
@@ -115,6 +115,8 @@ export async function streamChat(opts: {
           max_tokens: opts.maxTokens ?? 1000,
           temperature: opts.temperature ?? 0.5,
           ...(opts.tools?.length ? { tools: opts.tools.map((t) => ({ type: "function", function: t })), tool_choice: "auto" } : {}),
+          // local reasoning models: skip the slow hidden "thinking" pass
+          ...(p.id === "ollama" ? { reasoning_effort: "none" } : {}),
         }),
         signal: opts.signal ?? AbortSignal.timeout(90_000),
       });
