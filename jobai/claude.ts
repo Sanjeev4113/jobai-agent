@@ -10,7 +10,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { z } from "zod";
 import { CANDIDATE, TARGET_ROLES, factSheet } from "./profile";
-import { chatJson, claudeFailed, claudeUsable, streamChat } from "../src/lib/llm/free";
+import { chatJson, claudeFailed, claudeUsable } from "../src/lib/llm/free";
 import type { Job } from "./sources";
 
 /** A model is always available: Claude when it has credit, otherwise the free chain (Groq → Gemini → OpenRouter → Pollinations). */
@@ -163,39 +163,124 @@ Return the full .tex and a short list of what you changed.${extra}`,
   return { ok: true as const, tex: out.tex, changes: out.changes };
 }
 
-/** Free models: the LaTeX comes back raw between markers (JSON-escaping a whole .tex file trips small models up). */
+/* ---------- tailoring by edits (free models) ----------
+ * The model never rewrites the file. JobAI cuts the body into editable segments (the summary, each skills line, each
+ * bullet), the model returns new text only for the segments worth changing, and the code splices them back. The template
+ * can't break, the output is ~10× smaller (fast even on the local model), and every edit is checked before it's used. */
+
+type Segment = { id: number; kind: "summary" | "skills" | "bullet"; start: number; end: number; text: string; label?: string };
+
+/** Index just after the brace that closes the one opening at `open` (or -1). */
+function closeBrace(s: string, open: number) {
+  let depth = 0;
+  for (let i = open; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return i;
+  }
+  return -1;
+}
+
+export function segments(tex: string): Segment[] {
+  const body = tex.indexOf("\\begin{document}");
+  const out: Segment[] = [];
+  const re = /\\resumeItem\{|\\small\{/g;
+  re.lastIndex = body;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(tex))) {
+    const open = m.index + m[0].length - 1;
+    const close = closeBrace(tex, open);
+    if (close < 0) break;
+    const inner = tex.slice(open + 1, close);
+    re.lastIndex = close;
+    if (m[0].startsWith("\\resumeItem")) out.push({ id: out.length + 1, kind: "bullet", start: open + 1, end: close, text: inner.trim() });
+    else {
+      const lab = inner.match(/^\s*\\item\s*\\textbf\{([^}]*)\}/);
+      if (lab) {
+        const s0 = open + 1 + inner.indexOf(lab[0]) + lab[0].length;
+        out.push({ id: out.length + 1, kind: "skills", start: s0, end: close, text: tex.slice(s0, close).trim(), label: lab[1] });
+      } else if (!/\\(item|textbf\{[^}]*:\})/.test(inner) && inner.trim().length > 80 && !/begin\{|\\section/.test(inner)) out.push({ id: out.length + 1, kind: "summary", start: open + 1, end: close, text: inner.trim() });
+    }
+  }
+  return out;
+}
+
+const Edits = z.object({ edits: z.array(z.object({ id: z.number().int(), text: z.string().min(1), why: z.string() })).max(40) });
+
+/** LaTeX → plain text the model can't break: \textbf{x} → **x**, \% → %. null if the segment uses other commands. */
+function toPlain(t: string): string | null {
+  const p = t.replace(/\\textbf\{([^{}]*)\}/g, "**$1**").replace(/\\([%&$#_])/g, "$1");
+  if (/\\/.test(p) || /[{}]/.test(p)) return null;
+  return p.replace(/\s+/g, " ").trim();
+}
+/** plain text → LaTeX: escape specials, **x** → \textbf{x}. null if the model slipped LaTeX or braces in. */
+function fromPlain(t: string): string | null {
+  if (/[\\{}]/.test(t) || (t.match(/\*\*/g) ?? []).length % 2) return null;
+  return t
+    .replace(/[%&$#_]/g, (c) => `\\${c}`)
+    .replace(/\*\*([^*]+)\*\*/g, "\\textbf{$1}")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+const nums = (t: string) => t.match(/\d+(?:\.\d+)?/g) ?? [];
+
 async function tailorFree(baseTex: string, job: Job, assessment: Assessment | null | undefined, extra: string) {
-  const { text } = await streamChat({
+  const segs = segments(baseTex)
+    .map((g) => ({ ...g, plain: toPlain(g.text) }))
+    .filter((g): g is Segment & { plain: string } => !!g.plain);
+  if (!segs.length) return null;
+  const listing = segs.map((g) => `[${g.id}] (${g.kind}${g.label ? `: ${g.label.replace(/\\/g, "")}` : ""}) ${g.plain}`).join("\n");
+  const res = await chatJson({
+    sensitive: true,
     task: "long",
-    sensitive: true, // the resume holds his phone number
-    maxTokens: 9000,
-    temperature: 0.2,
-    messages: [
-      {
-        role: "system",
-        content: `You tailor a LaTeX resume to one job description.
-RULES: keep everything before \\begin{document} byte-for-byte; keep every section title, section order, command and macro; only edit the human-readable text inside existing entries. Use only facts in the base resume or the candidate facts; never invent tools, metrics, employers or dates. Mirror the job's wording where truthful. Keep the same length (one page). Escape LaTeX special characters.${extra}
-OUTPUT FORMAT, exactly:
-<<<TEX
-(the complete .tex file)
-TEX>>>
-<<<CHANGES
-- one change per line
-CHANGES>>>`,
-      },
-      {
-        role: "user",
-        content: `CANDIDATE FACTS\n${factSheet()}\n\nJOB: ${job.title} at ${job.company}\n${job.description.slice(0, 8000)}\n${assessment ? `\nFIT NOTES: ${assessment.why}\nGAPS (do not paper over): ${assessment.gaps.join("; ")}` : ""}\n\nBASE RESUME (.tex)\n${baseTex}`,
-      },
-    ],
+    maxTokens: 3500,
+    schema: z.toJSONSchema(Edits),
+    parse: (x) => {
+      const r = Edits.safeParse(x);
+      return r.success ? { success: true, data: r.data } : { success: false, error: { message: r.error.message } };
+    },
+    system: `You tailor a resume to one job by rewriting the text of a few numbered segments. Segments are plain text: **double asterisks** mark bold; never write LaTeX, backslashes or braces.
+RULES
+- Return only segments worth changing (usually 4-10): lead bullets with what the job asks for, put the job's skills first in the skills lists, sharpen the summary for this role.
+- Truth: use only facts in the segments or the candidate facts. Never change or add numbers, years of experience, tools, employers, titles or achievements.
+- Mirror the job's wording where truthful (same names for the same technologies) for ATS matching.
+- Keep each segment about the same length (the resume must stay one page).
+- Skills segments are comma-separated lists without their label: only reorder them so the job's skills come first. Never move a skill to another list or add one.
+- "why": a short note on what you changed and why.${extra}`,
+    user: `CANDIDATE FACTS\n${factSheet()}\n\nJOB: ${job.title} at ${job.company}\n${job.description.slice(0, 6000)}\n${assessment ? `\nFIT NOTES: ${assessment.why}\nGAPS (do not paper over): ${assessment.gaps.join("; ")}` : ""}\n\nSEGMENTS\n${listing}`,
   });
-  const tex = text.match(/<<<TEX\s*\n([\s\S]*?)\n?TEX>>>/)?.[1] ?? text.match(/(\\documentclass[\s\S]*\\end\{document\})/)?.[1];
-  if (!tex) return null;
-  const changes = (text.match(/<<<CHANGES\s*\n([\s\S]*?)CHANGES>>>/)?.[1] ?? "")
-    .split("\n")
-    .map((l) => l.replace(/^\s*[-*]\s*/, "").trim())
-    .filter(Boolean);
-  return { tex: tex.trim() + "\n", changes };
+  const byId = new Map(segs.map((g) => [g.id, g]));
+  const applied: { seg: Segment; text: string; why: string }[] = [];
+  for (const e of res.edits) {
+    const g = byId.get(e.id);
+    if (!g || applied.some((a) => a.seg.id === g.id)) continue;
+    const plain = e.text.replace(/^\s*\*\*[^*]*:\*\*\s*/, "").trim();
+    if (plain.replace(/\W+/g, "") === g.plain.replace(/\W+/g, "")) continue; // nothing really changed
+    if (plain.length > g.plain.length * 1.3 + 40 || plain.length < g.plain.length * 0.5) continue; // keeps it one page
+    if (g.kind === "skills") {
+      // skills lines: reorder (and trim a little), but never move items between lines or invent new ones
+      const items = (t: string) => t.split(/[,;]/).map((x) => x.replace(/\*\*/g, "").trim().toLowerCase()).filter(Boolean);
+      const before = new Set(items(g.plain));
+      const after = items(plain);
+      if (after.some((x) => !before.has(x)) || after.length < before.size * 0.7) continue;
+    }
+    const have = new Set(nums(g.plain));
+    if (nums(plain).some((n) => !have.has(n))) continue; // a number not in this very segment = invented
+    const tex = fromPlain(plain);
+    if (!tex) continue;
+    applied.push({ seg: g, text: tex, why: e.why });
+  }
+  if (!applied.length) return null;
+  let tex = baseTex;
+  for (const a of [...applied].sort((x, y) => y.seg.start - x.seg.start)) {
+    const old = tex.slice(a.seg.start, a.seg.end);
+    tex = tex.slice(0, a.seg.start) + (old.match(/^\s*/)?.[0] ?? "") + a.text + (old.match(/\s*$/)?.[0] ?? "") + tex.slice(a.seg.end);
+  }
+  return { tex, changes: applied.sort((x, y) => x.seg.id - y.seg.id).map((a) => `${a.seg.kind === "bullet" ? "Bullet" : a.seg.kind === "summary" ? "Summary" : `Skills (${(a.seg.label ?? "").replace(/\\/g, "").replace(/:$/, "")})`}: ${a.why}`) };
 }
 
 /* ---------- upskill ---------- */
