@@ -228,59 +228,184 @@ function fromPlain(t: string): string | null {
 }
 const nums = (t: string) => t.match(/\d+(?:\.\d+)?/g) ?? [];
 
-async function tailorFree(baseTex: string, job: Job, assessment: Assessment | null | undefined, extra: string) {
+/** Everything a model needs to tailor by edits: the prompt and the JSON Schema of the answer (null: nothing editable). */
+export function tailorPrompt(baseTex: string, job: Job, assessment: Assessment | null | undefined, extra = "") {
   const segs = segments(baseTex)
     .map((g) => ({ ...g, plain: toPlain(g.text) }))
     .filter((g): g is Segment & { plain: string } => !!g.plain);
   if (!segs.length) return null;
   const listing = segs.map((g) => `[${g.id}] (${g.kind}${g.label ? `: ${g.label.replace(/\\/g, "")}` : ""}) ${g.plain}`).join("\n");
-  const res = await chatJson({
-    sensitive: true,
-    task: "long",
-    maxTokens: 3500,
-    schema: z.toJSONSchema(Edits),
-    parse: (x) => {
-      const r = Edits.safeParse(x);
-      return r.success ? { success: true, data: r.data } : { success: false, error: { message: r.error.message } };
-    },
+  return {
     system: `You tailor a resume to one job by rewriting the text of a few numbered segments. Segments are plain text: **double asterisks** mark bold; never write LaTeX, backslashes or braces.
 RULES
-- Return only segments worth changing (usually 4-10): lead bullets with what the job asks for, put the job's skills first in the skills lists, sharpen the summary for this role.
+- Return only segments worth rewording (usually 3-8): the summary, and the bullets most relevant to this job, so they lead with what the job asks for in the job's own words. The order of bullets and skills is handled automatically: don't return skills segments.
 - Truth: use only facts in the segments or the candidate facts. Never change or add numbers, years of experience, tools, employers, titles or achievements.
 - Mirror the job's wording where truthful (same names for the same technologies) for ATS matching.
 - Keep each segment about the same length (the resume must stay one page).
-- Skills segments are comma-separated lists without their label: only reorder them so the job's skills come first. Never move a skill to another list or add one.
+- Never add a skill, tool or technology to a segment that doesn't already mention it.
 - "why": a short note on what you changed and why.${extra}`,
     user: `CANDIDATE FACTS\n${factSheet()}\n\nJOB: ${job.title} at ${job.company}\n${job.description.slice(0, 6000)}\n${assessment ? `\nFIT NOTES: ${assessment.why}\nGAPS (do not paper over): ${assessment.gaps.join("; ")}` : ""}\n\nSEGMENTS\n${listing}`,
-  });
+    schema: z.toJSONSchema(Edits) as object,
+  };
+}
+
+/** Check a model's edits (truth, numbers, skills, length) and splice the good ones into the template. */
+export function applyEdits(baseTex: string, raw: unknown, jd = "") {
+  const parsed = Edits.safeParse(raw);
+  const res = parsed.success ? parsed.data : { edits: [] };
+  const segs = segments(baseTex)
+    .map((g) => ({ ...g, plain: toPlain(g.text) }))
+    .filter((g): g is Segment & { plain: string } => !!g.plain);
   const byId = new Map(segs.map((g) => [g.id, g]));
   const applied: { seg: Segment; text: string; why: string }[] = [];
+  const skipped: string[] = [];
+  const skip = (g: Segment, why: string) => void skipped.push(`${g.kind === "bullet" ? "Bullet" : g.kind === "summary" ? "Summary" : "Skills"} #${g.id}: ${why}`);
   for (const e of res.edits) {
     const g = byId.get(e.id);
     if (!g || applied.some((a) => a.seg.id === g.id)) continue;
     const plain = e.text.replace(/^\s*\*\*[^*]*:\*\*\s*/, "").trim();
     if (plain.replace(/\W+/g, "") === g.plain.replace(/\W+/g, "")) continue; // nothing really changed
-    if (plain.length > g.plain.length * 1.3 + 40 || plain.length < g.plain.length * 0.5) continue; // keeps it one page
+    if (plain.length > g.plain.length * 1.3 + 40 || plain.length < g.plain.length * 0.5) {
+      skip(g, "would change the length too much (the resume must stay one page)");
+      continue;
+    }
     if (g.kind === "skills") {
       // skills lines: reorder (and trim a little), but never move items between lines or invent new ones
       const items = (t: string) => t.split(/[,;]/).map((x) => x.replace(/\*\*/g, "").trim().toLowerCase()).filter(Boolean);
       const before = new Set(items(g.plain));
       const after = items(plain);
-      if (after.some((x) => !before.has(x)) || after.length < before.size * 0.7) continue;
+      if (after.some((x) => !before.has(x)) || after.length < before.size * 0.7) {
+        skip(g, "would add or drop skills (only reordering is allowed)");
+        continue;
+      }
     }
     const have = new Set(nums(g.plain));
-    if (nums(plain).some((n) => !have.has(n))) continue; // a number not in this very segment = invented
+    const added = nums(plain).filter((n) => !have.has(n));
+    if (added.length) {
+      skip(g, `would add a number that isn't on your resume (${added.join(", ")})`); // invented
+      continue;
+    }
     const tex = fromPlain(plain);
-    if (!tex) continue;
+    if (!tex) {
+      skip(g, "contained formatting that could break the template");
+      continue;
+    }
     applied.push({ seg: g, text: tex, why: e.why });
   }
-  if (!applied.length) return null;
-  let tex = baseTex;
-  for (const a of [...applied].sort((x, y) => y.seg.start - x.seg.start)) {
-    const old = tex.slice(a.seg.start, a.seg.end);
-    tex = tex.slice(0, a.seg.start) + (old.match(/^\s*/)?.[0] ?? "") + a.text + (old.match(/\s*$/)?.[0] ?? "") + tex.slice(a.seg.end);
+  const label = (g: Segment) => (g.label ?? "").replace(/\\/g, "").replace(/:$/, "");
+  const changes = applied.map((a) => ({ id: a.seg.id, text: `${a.seg.kind === "bullet" ? "Bullet" : a.seg.kind === "summary" ? "Summary" : `Skills (${label(a.seg)})`}: ${a.why}` }));
+  // final text of every segment: the model's checked edit, else the original
+  const final = new Map(segments(baseTex).map((g) => [g.id, g.text]));
+  for (const a of applied) final.set(a.seg.id, a.text);
+  const all = segments(baseTex);
+  if (jd) {
+    // exact, model-free tailoring: the job's skills first in every skills line…
+    for (const g of all.filter((x) => x.kind === "skills" && !applied.some((a) => a.seg.id === x.id))) {
+      const r = reorderSkills(final.get(g.id)!, jd);
+      if (r) {
+        final.set(g.id, r.text);
+        changes.push({ id: g.id, text: `Skills (${label(g)}): ${r.moved.join(", ")} moved first (the job asks for them)` });
+      }
+    }
+    // …and in every role/project, the bullets that match the job most lead the list
+    for (const group of bulletGroups(baseTex, all)) {
+      const ranked = group.map((g, i) => ({ g, i, score: relevance(final.get(g.id)!, jd) })).sort((x, y) => y.score - x.score || x.i - y.i);
+      if (ranked.every((r, i) => r.i === i)) continue;
+      const texts = ranked.map((r) => final.get(r.g.id)!);
+      group.forEach((g, i) => final.set(g.id, texts[i]));
+      changes.push({ id: group[0].id, text: `${group.name}: reordered bullets so the most relevant to this job come first` });
+    }
   }
-  return { tex, changes: applied.sort((x, y) => x.seg.id - y.seg.id).map((a) => `${a.seg.kind === "bullet" ? "Bullet" : a.seg.kind === "summary" ? "Summary" : `Skills (${(a.seg.label ?? "").replace(/\\/g, "").replace(/:$/, "")})`}: ${a.why}`) };
+  const touched = all.filter((g) => final.get(g.id) !== g.text);
+  if (!touched.length) return skipped.length ? { tex: null, changes: [], skipped } : null;
+  let tex = baseTex;
+  for (const g of [...touched].sort((x, y) => y.start - x.start)) {
+    const old = tex.slice(g.start, g.end);
+    tex = tex.slice(0, g.start) + (old.match(/^\s*/)?.[0] ?? "") + final.get(g.id)!.trim() + (old.match(/\s*$/)?.[0] ?? "") + tex.slice(g.end);
+  }
+  return { tex: tex as string | null, skipped, changes: changes.sort((x, y) => x.id - y.id).map((c) => c.text) };
+}
+
+/* ---- deterministic tailoring helpers (no model, nothing invented) ---- */
+const STOP = new Set("and the for with you your our are will have has this that from into able work team using use good strong across about years year experience role job who what when where they them their its can more such other within".split(" "));
+const plainOf = (t: string) => t.replace(/\\textbf\{([^{}]*)\}/g, "$1").replace(/\\([%&$#_])/g, "$1").replace(/\\[a-zA-Z]+/g, " ").replace(/[{}]/g, "");
+const has = (hay: string, term: string) => {
+  const t = term.trim().toLowerCase();
+  if (t.length < 2) return false;
+  const esc = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^a-z0-9+#])${esc}($|[^a-z0-9+#])`, "i").test(hay);
+};
+/** How much a bullet speaks to the job: distinct job words it uses, tech terms weighing more. */
+function relevance(text: string, jd: string) {
+  const words = new Set(plainOf(text).toLowerCase().match(/[a-z][a-z0-9+#.]{2,}/g) ?? []);
+  let score = 0;
+  for (const w of words) if (!STOP.has(w) && has(jd, w)) score += /[+#.]|^(java|spring|kafka|docker|kubernetes|aws|sql|react|node|python|api|rest|redis|cache|test|ci|cd|linux|microservices?)$/.test(w) ? 2 : 1;
+  return score;
+}
+/** Split a skills line at top-level commas (not inside parentheses or braces). */
+function splitTop(t: string) {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = "";
+  for (const c of t) {
+    if (c === "(" || c === "{") depth++;
+    if (c === ")" || c === "}") depth--;
+    if (c === "," && depth === 0) {
+      out.push(cur.trim());
+      cur = "";
+    } else cur += c;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+function reorderSkills(text: string, jd: string) {
+  const items = splitTop(text);
+  if (items.length < 2) return null;
+  const hit = (x: string) => {
+    const p = plainOf(x);
+    return has(jd, p) || has(jd, p.replace(/\s*\(.*\)\s*/, "")) || p.split(/[\s/()]+/).some((w) => w.length > 2 && !STOP.has(w.toLowerCase()) && has(jd, w));
+  };
+  const first = items.filter(hit);
+  if (!first.length || first.length === items.length) return null;
+  const order = [...first, ...items.filter((x) => !hit(x))];
+  if (order.every((x, i) => x === items[i])) return null;
+  return { text: order.join(", "), moved: first.map((x) => plainOf(x).replace(/\s*\(.*\)/, "")).slice(0, 4) };
+}
+/** Bullets grouped by the list they sit in (one role or project each), named by the heading above it. */
+function bulletGroups(tex: string, all: Segment[]) {
+  const groups: (Segment[] & { name: string })[] = [];
+  const re = /\\resumeItemListStart([\s\S]*?)\\resumeItemListEnd/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(tex))) {
+    const from = m.index;
+    const to = m.index + m[0].length;
+    const inside = all.filter((g) => g.kind === "bullet" && g.start > from && g.end < to);
+    if (inside.length < 2) continue;
+    const head = tex.slice(Math.max(0, from - 600), from).match(/\\resumeSubheading\s*\{([^{}]*)\}\s*\{[^{}]*\}\s*\{([^{}]*)\}/g)?.pop();
+    const parts = head?.match(/\{([^{}]*)\}/g)?.map((x) => plainOf(x.slice(1, -1)).trim()) ?? [];
+    groups.push(Object.assign(inside, { name: parts[0] ? `${parts[0]}${parts[2] ? ` (${parts[2]})` : ""}` : "Experience" }));
+  }
+  return groups;
+}
+
+
+async function tailorFree(baseTex: string, job: Job, assessment: Assessment | null | undefined, extra: string) {
+  const p = tailorPrompt(baseTex, job, assessment, extra);
+  if (!p) return null;
+  const res = await chatJson({
+    sensitive: true,
+    task: "long",
+    maxTokens: 3500,
+    schema: p.schema,
+    parse: (x) => {
+      const r = Edits.safeParse(x);
+      return r.success ? { success: true, data: r.data } : { success: false, error: { message: r.error.message } };
+    },
+    system: p.system,
+    user: p.user,
+  });
+  const out = applyEdits(baseTex, res, job.description);
+  return out?.tex ? { tex: out.tex, changes: out.changes } : null;
 }
 
 /* ---------- upskill ---------- */
